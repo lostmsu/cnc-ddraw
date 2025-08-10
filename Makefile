@@ -36,7 +36,15 @@ SRCS     := $(wildcard src/*.c) $(wildcard src/*/*.c) res.rc
 OBJS     := $(addsuffix .o, $(basename $(SRCS)))
 
 .PHONY: clean all
-all: $(TARGET)
+all: $(TARGET) test_dsr
+
+test_dsr: test_dsr.exe
+
+test_dsr.exe: tests/test_dsr.o $(TARGET)
+	$(CC) -o $@ $< -L. -lddraw
+
+tests/test_dsr.o: tests/test_dsr.c
+	$(CC) $(CFLAGS) -Iinc -c -o $@ $<
 
 %.o: %.rc
 	$(WINDRES) -J rc $< $@ || windres -J rc $< $@
