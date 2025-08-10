@@ -39,6 +39,7 @@ static BOOL d3d9_check_succeeded(HRESULT hr, const char* stmt);
 static BOOL d3d9_create_resources();
 static BOOL d3d9_set_states();
 static BOOL d3d9_update_vertices(BOOL upscale_hack, BOOL stretch);
+static BOOL d3d9_check_dsr_support();
 static void d3d9_init_dsr();
 
 static D3D9RENDERER g_d3d9;
@@ -189,7 +190,8 @@ BOOL d3d9_create()
                         g_d3d9.device->lpVtbl->QueryInterface(g_d3d9.device, &IID_IDirect3DDevice9On12, (void**)&g_d3d9on12_device);
                     }
 
-                    if (g_config.superresolution)
+                    if (strcmp(g_config.superresolution, "on") == 0 ||
+                        (strcmp(g_config.superresolution, "auto") == 0 && d3d9_check_dsr_support()))
                     {
                         d3d9_init_dsr();
                     }
@@ -202,22 +204,51 @@ BOOL d3d9_create()
     return FALSE;
 }
 
+static BOOL d3d9_check_dsr_support()
+{
+    if (!g_d3d9on12_device)
+        return FALSE;
+
+    ID3D12Device* d3d12_device = NULL;
+    if (FAILED(g_d3d9on12_device->lpVtbl->GetD3D12Device(g_d3d9on12_device, &IID_ID3D12Device, (void**)&d3d12_device)))
+        return FALSE;
+
+    ID3D12DSRDeviceFactory* dsr_factory = NULL;
+    HRESULT(WINAPI * d3d12_get_interface)(REFCLSID, REFIID, void**) =
+        (void*)real_GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12GetInterface");
+
+    if (!d3d12_get_interface || FAILED(d3d12_get_interface(&CLSID_D3D12DSRDeviceFactory, &IID_ID3D12DSRDeviceFactory, (void**)&dsr_factory)))
+    {
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return FALSE;
+    }
+
+    IDSRDevice* dsr_device = NULL;
+    if (FAILED(dsr_factory->lpVtbl->CreateDSRDevice(dsr_factory, d3d12_device, &IID_IDSRDevice, (void**)&dsr_device)))
+    {
+        dsr_factory->lpVtbl->Release(dsr_factory);
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return FALSE;
+    }
+
+    UINT variant_count = dsr_device->lpVtbl->GetNumSuperResVariants(dsr_device);
+    dsr_device->lpVtbl->Release(dsr_device);
+    dsr_factory->lpVtbl->Release(dsr_factory);
+    d3d12_device->lpVtbl->Release(d3d12_device);
+
+    return variant_count > 0;
+}
+
 static void d3d9_init_dsr()
 {
-    if (!g_d3d9.device)
-        return;
-
-    if (!g_d3d9on12_device)
+    if (!g_d3d9.device || !g_d3d9on12_device)
         return;
 
     ID3D12Device* d3d12_device = NULL;
     if (FAILED(g_d3d9on12_device->lpVtbl->GetD3D12Device(g_d3d9on12_device, &IID_ID3D12Device, (void**)&d3d12_device)))
-    {
         return;
-    }
 
     ID3D12DSRDeviceFactory* dsr_factory = NULL;
-
     HRESULT(WINAPI * d3d12_get_interface)(REFCLSID, REFIID, void**) =
         (void*)real_GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12GetInterface");
 
@@ -228,16 +259,6 @@ static void d3d9_init_dsr()
     }
 
     if (FAILED(dsr_factory->lpVtbl->CreateDSRDevice(dsr_factory, d3d12_device, &IID_IDSRDevice, (void**)&g_dsr_device)))
-    {
-        dsr_factory->lpVtbl->Release(dsr_factory);
-        d3d12_device->lpVtbl->Release(d3d12_device);
-        return;
-    }
-
-    UINT variant_count = g_dsr_device->lpVtbl->GetNumSuperResVariants(g_dsr_device);
-    TRACE("DirectSR: Found %d super resolution variants\n", variant_count);
-
-    if (variant_count == 0)
     {
         dsr_factory->lpVtbl->Release(dsr_factory);
         d3d12_device->lpVtbl->Release(d3d12_device);

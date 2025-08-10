@@ -60,8 +60,8 @@ void cfg_load()
     GET_STRING("screenshotdir", ".\\Screenshots\\", g_config.screenshot_dir, sizeof(g_config.screenshot_dir));
     GET_BOOL(g_config.toggle_borderless, "toggle_borderless", FALSE);
     GET_BOOL(g_config.toggle_upscaled, "toggle_upscaled", FALSE);
-    GET_BOOL(g_config.superresolution, "superresolution", FALSE);
-    GET_BOOL(g_config.framegeneration, "framegeneration", FALSE);
+    GET_STRING("superresolution", "auto", g_config.superresolution, sizeof(g_config.superresolution));
+    GET_STRING("framegeneration", "auto", g_config.framegeneration, sizeof(g_config.framegeneration));
 
     /* Compatibility settings */
 
@@ -280,10 +280,12 @@ static void cfg_create_ini()
             "toggle_upscaled=false\n"
             "\n"
             "; Enable neural super resolution (instead of regular stretch) on GPUs that support it\n"
-            "superresolution=false\n"
+            "; Possible values: auto, on, off\n"
+            "superresolution=auto\n"
             "\n"
             "; Enable neural frame generation on GPUs that support it\n"
-            "framegeneration=false\n"
+            "; Possible values: auto, on, off\n"
+            "framegeneration=auto\n"
             "\n"
             "\n"
             "\n"
