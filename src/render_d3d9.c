@@ -13,6 +13,17 @@
 #include "d3d9types.h"
 #include "hook.h"
 #include "config.h"
+#include <initguid.h>
+#include "dsr.h"
+#include <d3d12.h>
+#include <dxgi1_6.h>
+
+DEFINE_GUID(CLSID_D3D12DSRDeviceFactory, 0x936f7f01, 0x203f, 0x44d3, 0x9e, 0x18, 0x41, 0x98, 0xd2, 0x43, 0xb4, 0xea);
+DEFINE_GUID(IID_ID3D12DSRDeviceFactory, 0x936f7f01, 0x203f, 0x44d3, 0x9e, 0x18, 0x41, 0x98, 0xd2, 0x43, 0xb4, 0xeb);
+DEFINE_GUID(IID_IDSRDevice, 0x936f7f01, 0x203f, 0x44d3, 0x9e, 0x18, 0x41, 0x98, 0xd2, 0x43, 0xb4, 0xec);
+DEFINE_GUID(IID_IDSRSuperResEngine, 0x936f7f01, 0x203f, 0x44d3, 0x9e, 0x18, 0x41, 0x98, 0xd2, 0x43, 0xb4, 0xed);
+DEFINE_GUID(IID_IDSRSuperResUpscaler, 0x936f7f01, 0x203f, 0x44d3, 0x9e, 0x18, 0x41, 0x98, 0xd2, 0x43, 0xb4, 0xee);
+DEFINE_GUID(IID_IDirect3DDevice9On12, 0xe7fda234, 0xb589, 0x4042, 0x87, 0x34, 0x10, 0x52, 0x33, 0x7, 0x14, 0x58);
 
 
 #ifdef _DEBUG
@@ -28,8 +39,15 @@ static BOOL d3d9_check_succeeded(HRESULT hr, const char* stmt);
 static BOOL d3d9_create_resources();
 static BOOL d3d9_set_states();
 static BOOL d3d9_update_vertices(BOOL upscale_hack, BOOL stretch);
+static void d3d9_init_dsr();
 
 static D3D9RENDERER g_d3d9;
+static IDSRDevice* g_dsr_device;
+static IDSRSuperResEngine* g_dsr_engine;
+static IDSRSuperResUpscaler* g_dsr_upscaler;
+static ID3D12Resource* g_dummy_depth_resource;
+static ID3D12Resource* g_dummy_mv_resource;
+static IDirect3DDevice9On12* g_d3d9on12_device;
 
 BOOL d3d9_is_available()
 {
@@ -165,12 +183,154 @@ BOOL d3d9_create()
                         behavior_flags[i],
                         &g_d3d9.params,
                         &g_d3d9.device)))
+                {
+                    if (g_config.d3d9on12)
+                    {
+                        g_d3d9.device->lpVtbl->QueryInterface(g_d3d9.device, &IID_IDirect3DDevice9On12, (void**)&g_d3d9on12_device);
+                    }
+
+                    if (g_config.superresolution)
+                    {
+                        d3d9_init_dsr();
+                    }
                     return g_d3d9.device && d3d9_create_resources() && d3d9_set_states();
+                }
             }
         }
     }
 
     return FALSE;
+}
+
+static void d3d9_init_dsr()
+{
+    if (!g_d3d9.device)
+        return;
+
+    if (!g_d3d9on12_device)
+        return;
+
+    ID3D12Device* d3d12_device = NULL;
+    if (FAILED(g_d3d9on12_device->lpVtbl->GetD3D12Device(g_d3d9on12_device, &IID_ID3D12Device, (void**)&d3d12_device)))
+    {
+        return;
+    }
+
+    ID3D12DSRDeviceFactory* dsr_factory = NULL;
+
+    HRESULT(WINAPI * d3d12_get_interface)(REFCLSID, REFIID, void**) =
+        (void*)real_GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12GetInterface");
+
+    if (!d3d12_get_interface || FAILED(d3d12_get_interface(&CLSID_D3D12DSRDeviceFactory, &IID_ID3D12DSRDeviceFactory, (void**)&dsr_factory)))
+    {
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return;
+    }
+
+    if (FAILED(dsr_factory->lpVtbl->CreateDSRDevice(dsr_factory, d3d12_device, &IID_IDSRDevice, (void**)&g_dsr_device)))
+    {
+        dsr_factory->lpVtbl->Release(dsr_factory);
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return;
+    }
+
+    UINT variant_count = g_dsr_device->lpVtbl->GetNumSuperResVariants(g_dsr_device);
+    TRACE("DirectSR: Found %d super resolution variants\n", variant_count);
+
+    if (variant_count == 0)
+    {
+        dsr_factory->lpVtbl->Release(dsr_factory);
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return;
+    }
+
+    DSR_SUPERRES_VARIANT_DESC variant_desc;
+    if (FAILED(g_dsr_device->lpVtbl->GetSuperResVariantDesc(g_dsr_device, 0, &variant_desc)))
+    {
+        dsr_factory->lpVtbl->Release(dsr_factory);
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return;
+    }
+
+    TRACE("DirectSR: Using variant %s\n", variant_desc.VariantName);
+
+    DSR_SUPERRES_CREATE_ENGINE_PARAMETERS engine_params = { 0 };
+    engine_params.VariantId = variant_desc.VariantId;
+    engine_params.TargetFormat = g_d3d9.params.BackBufferFormat;
+    engine_params.SourceColorFormat = g_ddraw.bpp == 16 ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
+    engine_params.SourceDepthFormat = DXGI_FORMAT_D32_FLOAT;
+    engine_params.Flags = DSR_SUPERRES_CREATE_ENGINE_FLAG_NONE;
+    engine_params.TargetSize.Width = g_ddraw.render.width;
+    engine_params.TargetSize.Height = g_ddraw.render.height;
+    engine_params.MaxSourceSize.Width = g_ddraw.width;
+    engine_params.MaxSourceSize.Height = g_ddraw.height;
+
+    if (FAILED(g_dsr_device->lpVtbl->CreateSuperResEngine(g_dsr_device, &engine_params, &IID_IDSRSuperResEngine, (void**)&g_dsr_engine)))
+    {
+        dsr_factory->lpVtbl->Release(dsr_factory);
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return;
+    }
+
+    ID3D12CommandQueue* command_queue = NULL;
+    D3D12_COMMAND_QUEUE_DESC queue_desc = { 0 };
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(d3d12_device->lpVtbl->CreateCommandQueue(d3d12_device, &queue_desc, &IID_ID3D12CommandQueue, (void**)&command_queue)))
+    {
+        dsr_factory->lpVtbl->Release(dsr_factory);
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return;
+    }
+
+    if (FAILED(g_dsr_engine->lpVtbl->CreateUpscaler(g_dsr_engine, command_queue, &IID_IDSRSuperResUpscaler, (void**)&g_dsr_upscaler)))
+    {
+        command_queue->lpVtbl->Release(command_queue);
+        dsr_factory->lpVtbl->Release(dsr_factory);
+        d3d12_device->lpVtbl->Release(d3d12_device);
+        return;
+    }
+
+    D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC resource_desc = {
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        0,
+        g_ddraw.width,
+        g_ddraw.height,
+        1,
+        1,
+        DXGI_FORMAT_D32_FLOAT,
+        {1, 0},
+        D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+    };
+
+    if (SUCCEEDED(d3d12_device->lpVtbl->CreateCommittedResource(
+        d3d12_device,
+        &heap_props,
+        D3D12_HEAP_FLAG_NONE,
+        &resource_desc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        NULL,
+        &IID_ID3D12Resource,
+        (void**)&g_dummy_depth_resource)))
+    {
+        resource_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        resource_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        d3d12_device->lpVtbl->CreateCommittedResource(
+            d3d12_device,
+            &heap_props,
+            D3D12_HEAP_FLAG_NONE,
+            &resource_desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            NULL,
+            &IID_ID3D12Resource,
+            (void**)&g_dummy_mv_resource);
+    }
+
+    command_queue->lpVtbl->Release(command_queue);
+    dsr_factory->lpVtbl->Release(dsr_factory);
+    d3d12_device->lpVtbl->Release(d3d12_device);
 }
 
 #ifdef _DEBUG
@@ -274,6 +434,42 @@ BOOL d3d9_release_resources()
 BOOL d3d9_release()
 {
     d3d9_release_resources();
+
+    if (g_d3d9on12_device)
+    {
+        g_d3d9on12_device->lpVtbl->Release(g_d3d9on12_device);
+        g_d3d9on12_device = NULL;
+    }
+
+    if (g_dummy_depth_resource)
+    {
+        g_dummy_depth_resource->lpVtbl->Release(g_dummy_depth_resource);
+        g_dummy_depth_resource = NULL;
+    }
+
+    if (g_dummy_mv_resource)
+    {
+        g_dummy_mv_resource->lpVtbl->Release(g_dummy_mv_resource);
+        g_dummy_mv_resource = NULL;
+    }
+
+    if (g_dsr_upscaler)
+    {
+        g_dsr_upscaler->lpVtbl->Release(g_dsr_upscaler);
+        g_dsr_upscaler = NULL;
+    }
+
+    if (g_dsr_engine)
+    {
+        g_dsr_engine->lpVtbl->Release(g_dsr_engine);
+        g_dsr_engine = NULL;
+    }
+
+    if (g_dsr_device)
+    {
+        g_dsr_device->lpVtbl->Release(g_dsr_device);
+        g_dsr_device = NULL;
+    }
 
     if (g_d3d9.device)
     {
@@ -702,6 +898,33 @@ DWORD WINAPI d3d9_render_main(void)
         IDirect3DDevice9_BeginScene(g_d3d9.device);
         IDirect3DDevice9_DrawPrimitive(g_d3d9.device, D3DPT_TRIANGLESTRIP, 0, 2);
         IDirect3DDevice9_EndScene(g_d3d9.device);
+
+        if (g_dsr_upscaler)
+        {
+            ID3D12Resource* src_res = NULL;
+            if (SUCCEEDED(g_d3d9on12_device->lpVtbl->GetD3D12Resource(g_d3d9on12_device, (IDirect3DResource9*)g_d3d9.surface_tex[tex_index], &IID_ID3D12Resource, (void**)&src_res)))
+            {
+                IDirect3DSurface9* back_buffer = NULL;
+                if (SUCCEEDED(g_d3d9.device->lpVtbl->GetBackBuffer(g_d3d9.device, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back_buffer)))
+                {
+                    ID3D12Resource* dst_res = NULL;
+                    if (SUCCEEDED(g_d3d9on12_device->lpVtbl->GetD3D12Resource(g_d3d9on12_device, (IDirect3DResource9*)back_buffer, &IID_ID3D12Resource, (void**)&dst_res)))
+                    {
+                        DSR_SUPERRES_UPSCALER_EXECUTE_PARAMETERS params = { 0 };
+                        params.pSourceColorTexture = src_res;
+                        params.pTargetTexture = dst_res;
+                        params.pSourceDepthTexture = g_dummy_depth_resource;
+                        params.pMotionVectorsTexture = g_dummy_mv_resource;
+
+                        g_dsr_upscaler->lpVtbl->Execute(g_dsr_upscaler, &params, 0, DSR_SUPERRES_UPSCALER_EXECUTE_FLAG_NONE);
+
+                        dst_res->lpVtbl->Release(dst_res);
+                    }
+                    back_buffer->lpVtbl->Release(back_buffer);
+                }
+                src_res->lpVtbl->Release(src_res);
+            }
+        }
 
         if (g_ddraw.bnet_active)
         {

@@ -60,6 +60,8 @@ void cfg_load()
     GET_STRING("screenshotdir", ".\\Screenshots\\", g_config.screenshot_dir, sizeof(g_config.screenshot_dir));
     GET_BOOL(g_config.toggle_borderless, "toggle_borderless", FALSE);
     GET_BOOL(g_config.toggle_upscaled, "toggle_upscaled", FALSE);
+    GET_BOOL(g_config.superresolution, "superresolution", FALSE);
+    GET_BOOL(g_config.framegeneration, "framegeneration", FALSE);
 
     /* Compatibility settings */
 
@@ -276,6 +278,12 @@ static void cfg_create_ini()
             "\n"
             "; Switch between windowed/fullscreen upscaled modes with alt+enter rather than windowed/fullscreen modes\n"
             "toggle_upscaled=false\n"
+            "\n"
+            "; Enable neural super resolution (instead of regular stretch) on GPUs that support it\n"
+            "superresolution=false\n"
+            "\n"
+            "; Enable neural frame generation on GPUs that support it\n"
+            "framegeneration=false\n"
             "\n"
             "\n"
             "\n"

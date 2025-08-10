@@ -48,6 +48,8 @@ typedef struct CNCDDRAWCONFIG
     char screenshot_dir[MAX_PATH];
     BOOL toggle_borderless;
     BOOL toggle_upscaled;
+    BOOL superresolution;
+    BOOL framegeneration;
 
     /* Compatibility settings */
 
